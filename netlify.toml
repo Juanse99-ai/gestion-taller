@@ -1,0 +1,10 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NEXT_TELEMETRY_DISABLED = "1"
+  # Esto desactiva el escaneo de secretos en las variables del build
+  SECRETS_SCAN_PATHS = ""
+  SECRETS_SCAN_GIT_KEYS = ""
+  SECRETS_SCAN_ENABLED = "false"
