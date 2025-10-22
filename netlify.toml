@@ -1,63 +1,213 @@
-// middleware.ts
-import type { NextRequest } from 'next/server';
-import { NextResponse } from 'next/server';
+# netlify.toml (no usado; despliegue en Vercel). Archivo dejado vacío intencionalmente.
+---
+import { createClient } from '@supabase/supabase-js';
 
-const USER = process.env.BASIC_AUTH_USER || '';
-const PASS = process.env.BASIC_AUTH_PASS || '';
+// Server-side Supabase client
+export function getSupabaseServer() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  if (!url || !anon) {
+    throw new Error('Faltan variables NEXT_PUBLIC_SUPABASE_URL o NEXT_PUBLIC_SUPABASE_ANON_KEY');
+  }
+  return createClient(url, anon, { auth: { persistSession: false } });
+}
+---
+import { NextRequest, NextResponse } from 'next/server';
+import { getSupabaseServer } from '@/src/lib/supabase';
 
-function unauthorized(): NextResponse {
-  return new NextResponse('Authentication required', {
-    status: 401,
-    headers: {
-      'WWW-Authenticate': 'Basic realm="Protected Area", charset="UTF-8"',
-    },
-  });
+type AnyRow = Record<string, any>;
+
+// Mapea cabeceras comunes a campos "estándar"
+function normalizarFila(row: AnyRow) {
+  const lower: AnyRow = {};
+  for (const k of Object.keys(row)) lower[k.trim().toLowerCase()] = row[k];
+
+  const get = (...keys: string[]) => {
+    for (const k of keys) {
+      if (lower[k] !== undefined && lower[k] !== null && `${lower[k]}`.trim() !== '') return lower[k];
+    }
+    return null;
+  };
+
+  return {
+    codigo: get('codigo', 'código', 'sku', 'referencia'),
+    nombre: get('nombre', 'descripcion', 'descripción', 'producto', 'detalle'),
+    marca: get('marca', 'brand'),
+    categoria: get('categoria', 'categoría'),
+    precio: Number(get('precio', 'valor', 'precio_venta', 'pvp')) || null,
+    costo: Number(get('costo', 'coste')) || null,
+    stock: Number(get('stock', 'existencia', 'cantidad')) || null,
+    ubicacion: get('ubicacion', 'ubicación', 'localizacion', 'localización', 'bodega'),
+    raw: lower,
+  };
 }
 
-// atob seguro para Edge/Node
-function decodeBase64(input: string): string {
-  if (typeof atob === 'function') return atob(input);
+export async function POST(req: NextRequest) {
   try {
-    // @ts-ignore: Buffer puede no existir en Edge, protegido por try/catch
-    return Buffer.from(input, 'base64').toString('utf-8');
-  } catch {
-    return '';
+    const body = await req.json();
+    const rows: AnyRow[] = Array.isArray(body?.rows) ? body.rows : [];
+    if (!rows.length) {
+      return NextResponse.json({ ok: false, message: 'No llegaron filas para importar.' }, { status: 400 });
+    }
+
+    // Normaliza
+    const normalizadas = rows.map(normalizarFila);
+
+    // Inserta/actualiza en Supabase (tabla "inventario")
+    let inserted = 0;
+    let supabaseError: string | null = null;
+    try {
+      const supabase = getSupabaseServer();
+      const { error, count } = await supabase
+        .from('inventario')
+        .upsert(normalizadas, { onConflict: 'codigo', ignoreDuplicates: false, count: 'estimated' });
+      if (error) supabaseError = error.message;
+      else inserted = count ?? normalizadas.length;
+    } catch (e: any) {
+      supabaseError = e?.message || 'Error creando cliente de Supabase';
+    }
+
+    return NextResponse.json({
+      ok: true,
+      recibidas: rows.length,
+      normalizadas: normalizadas.length,
+      insertadas: inserted,
+      supabaseError,
+    });
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, message: e?.message || 'Error importando' }, { status: 500 });
   }
 }
+---
+'use client';
 
-export function middleware(req: NextRequest): NextResponse {
-  const { pathname } = req.nextUrl;
+import { useCallback, useMemo, useState } from 'react';
+import * as XLSX from 'xlsx';
 
-  // Permitir assets/metadatos sin auth
-  if (
-    pathname.startsWith('/_next/') ||
-    pathname === '/favicon.ico' ||
-    pathname === '/robots.txt' ||
-    pathname === '/sitemap.xml'
-  ) {
-    return NextResponse.next();
-  }
+type Row = Record<string, any>;
 
-  // Si no hay credenciales configuradas, no bloquear
-  if (!USER || !PASS) return NextResponse.next();
+export default function Page() {
+  const [fileName, setFileName] = useState<string>('');
+  const [rows, setRows] = useState<Row[]>([]);
+  const [status, setStatus] = useState<string>('');
+  const [sending, setSending] = useState<boolean>(false);
+  const [result, setResult] = useState<any>(null);
 
-  const auth = req.headers.get('authorization') || '';
-  if (!auth) return unauthorized();
+  const help = useMemo(
+    () => ({
+      title: 'Importar Inventario (Excel)',
+      tips: [
+        'Formatos soportados: .xlsx, .xls, .csv',
+        'Primera fila como encabezados.',
+        'Campos comunes: código, nombre/descripcion, marca, categoría, precio, costo, stock, ubicación.',
+      ],
+    }),
+    []
+  );
 
-  const [scheme, encoded] = auth.split(' ');
-  if (scheme !== 'Basic' || !encoded) return unauthorized();
+  const parseFile = useCallback(async (file: File) => {
+    setStatus('Leyendo archivo…');
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json<Row>(ws, { defval: null });
+    setRows(data);
+    setStatus(`Archivo leído: ${data.length} filas.`);
+  }, []);
 
-  const decoded = decodeBase64(encoded);
-  const [user, pass] = decoded.split(':');
+  const onFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFileName(f.name);
+    await parseFile(f);
+  }, [parseFile]);
 
-  if (user === USER && pass === PASS) {
-    return NextResponse.next();
-  }
+  const onDrop = useCallback(async (ev: React.DragEvent<HTMLDivElement>) => {
+    ev.preventDefault();
+    const f = ev.dataTransfer.files?.[0];
+    if (!f) return;
+    setFileName(f.name);
+    await parseFile(f);
+  }, [parseFile]);
 
-  return unauthorized();
+  const preventDrag = (e: React.DragEvent<HTMLDivElement>) => e.preventDefault();
+
+  const sendToApi = useCallback(async () => {
+    if (!rows.length) {
+      setStatus('No hay filas para enviar.');
+      return;
+    }
+    setSending(true);
+    setStatus('Enviando datos…');
+
+    const size = 1000;
+    let total = rows.length;
+    let lastResponse: any = null;
+
+    for (let i = 0; i < rows.length; i += size) {
+      const slice = rows.slice(i, i + size);
+      const res = await fetch('/api/inventario/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows: slice }),
+      });
+      const json = await res.json();
+      lastResponse = json;
+      if (!res.ok || json?.ok === false) {
+        setStatus(`Error enviando lote ${i / size + 1}: ${json?.message || res.statusText}`);
+        setSending(false);
+        return;
+      }
+      setStatus(`Enviado ${Math.min(i + size, total)} / ${total}…`);
+    }
+
+    setSending(false);
+    setResult(lastResponse);
+    setStatus('Importación finalizada.');
+  }, [rows]);
+
+  return (
+    <main style={{ padding: 24, maxWidth: 900, margin: '0 auto', fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto' }}>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>{help.title}</h1>
+
+      <ul style={{ margin: 0, paddingLeft: 18, color: '#555', marginBottom: 16 }}>
+        {help.tips.map((t) => <li key={t}>{t}</li>)}
+      </ul>
+
+      <div
+        onDrop={onDrop}
+        onDragOver={preventDrag}
+        onDragEnter={preventDrag}
+        style={{ border: '2px dashed #bbb', borderRadius: 10, padding: 24, marginBottom: 12, background: '#fafafa' }}
+      >
+        <p style={{ marginTop: 0, marginBottom: 8, color: '#666' }}>
+          Arrastra y suelta el archivo aquí o usa el selector:
+        </p>
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={onFileChange} />
+        {fileName && <p style={{ marginTop: 12 }}>Archivo seleccionado: <strong>{fileName}</strong></p>}
+      </div>
+
+      {!!rows.length && (
+        <div style={{ marginBottom: 12, color: '#333' }}>
+          <strong>Filas detectadas:</strong> {rows.length}
+        </div>
+      )}
+
+      <button
+        disabled={!rows.length || sending}
+        onClick={sendToApi}
+        style={{ background: sending ? '#aaa' : '#111827', color: '#fff', border: 0, padding: '10px 14px', borderRadius: 8, cursor: sending ? 'not-allowed' : 'pointer' }}
+      >
+        {sending ? 'Enviando…' : 'Importar ahora'}
+      </button>
+
+      {status && <p style={{ marginTop: 16, color: '#444' }}><em>{status}</em></p>}
+
+      {result && (
+        <pre style={{ background: '#0b1022', color: '#d1e7ff', padding: 16, borderRadius: 8, overflow: 'auto', marginTop: 12 }}>
+{JSON.stringify(result, null, 2)}
+        </pre>
+      )}
+    </main>
+  );
 }
-
-// Aplica a todo excepto los estáticos de Next/archivos públicos comunes
-export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml).*)'],
-};
