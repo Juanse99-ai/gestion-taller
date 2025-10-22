@@ -69,7 +69,6 @@ export default function Page() {
         const { error } = await supabase
           .from('inventario')
           .upsert(slice, { onConflict: 'codigo', ignoreDuplicates: false });
-
         if (error) throw error;
         inserted += slice.length;
       }
