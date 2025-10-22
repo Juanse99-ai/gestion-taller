@@ -1,10 +1,63 @@
-[build]
-  command = "npm run build"
-  publish = ".next"
+// middleware.ts
+import type { NextRequest } from 'next/server';
+import { NextResponse } from 'next/server';
 
-[build.environment]
-  NEXT_TELEMETRY_DISABLED = "1"
-  # Esto desactiva el escaneo de secretos en las variables del build
-  SECRETS_SCAN_PATHS = ""
-  SECRETS_SCAN_GIT_KEYS = ""
-  SECRETS_SCAN_ENABLED = "false"
+const USER = process.env.BASIC_AUTH_USER || '';
+const PASS = process.env.BASIC_AUTH_PASS || '';
+
+function unauthorized(): NextResponse {
+  return new NextResponse('Authentication required', {
+    status: 401,
+    headers: {
+      'WWW-Authenticate': 'Basic realm="Protected Area", charset="UTF-8"',
+    },
+  });
+}
+
+// atob seguro para Edge/Node
+function decodeBase64(input: string): string {
+  if (typeof atob === 'function') return atob(input);
+  try {
+    // @ts-ignore: Buffer puede no existir en Edge, protegido por try/catch
+    return Buffer.from(input, 'base64').toString('utf-8');
+  } catch {
+    return '';
+  }
+}
+
+export function middleware(req: NextRequest): NextResponse {
+  const { pathname } = req.nextUrl;
+
+  // Permitir assets/metadatos sin auth
+  if (
+    pathname.startsWith('/_next/') ||
+    pathname === '/favicon.ico' ||
+    pathname === '/robots.txt' ||
+    pathname === '/sitemap.xml'
+  ) {
+    return NextResponse.next();
+  }
+
+  // Si no hay credenciales configuradas, no bloquear
+  if (!USER || !PASS) return NextResponse.next();
+
+  const auth = req.headers.get('authorization') || '';
+  if (!auth) return unauthorized();
+
+  const [scheme, encoded] = auth.split(' ');
+  if (scheme !== 'Basic' || !encoded) return unauthorized();
+
+  const decoded = decodeBase64(encoded);
+  const [user, pass] = decoded.split(':');
+
+  if (user === USER && pass === PASS) {
+    return NextResponse.next();
+  }
+
+  return unauthorized();
+}
+
+// Aplica a todo excepto los estáticos de Next/archivos públicos comunes
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml).*)'],
+};
